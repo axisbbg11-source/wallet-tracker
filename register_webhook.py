@@ -123,8 +123,13 @@ def main() -> int:
         result = register_webhook(
             arguments.webhook_url, api_key, wallets, webhook_secret
         )
-    except (OSError, ValueError, requests.RequestException):
-        logger.exception("Unable to register Helius webhook")
+    except (OSError, ValueError, requests.RequestException) as exc:
+        response = getattr(exc, "response", None)
+        logger.error(
+            "Unable to register Helius webhook (%s; HTTP status: %s)",
+            type(exc).__name__,
+            getattr(response, "status_code", None),
+        )
         return 1
     logger.info(result)
     return 0

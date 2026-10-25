@@ -1,4 +1,7 @@
 .env
+.ENV
+.env.*
+!.env.example
 wallets.txt
 *.db
 *.db-shm

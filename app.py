@@ -72,6 +72,16 @@ def initialize_database(database_path: str | Path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_claims (
+                signature TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY(signature, alert_type)
+            )
+            """
+        )
 
 
 def _default_wallets_path() -> Path:
@@ -117,14 +127,28 @@ def _token_transfer_amount(transfer: dict[str, Any]) -> float:
     return 0.0
 
 
-def _is_ignored_token(mint: str, transfer: dict[str, Any]) -> bool:
-    if mint in IGNORED_TOKEN_MINTS:
-        return True
-    symbols = {
-        str(transfer.get(key, "")).strip().upper()
-        for key in ("symbol", "tokenSymbol", "name")
-    }
-    return bool(symbols.intersection({"SOL", "WSOL", "USDC", "USDT"}))
+def _is_ignored_token(mint: str) -> bool:
+    return mint in IGNORED_TOKEN_MINTS
+
+
+def _swap_entries(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    return []
+
+
+def _swap_account(entry: dict[str, Any]) -> str | None:
+    for key in ("userAccount", "account", "owner"):
+        account = entry.get(key)
+        if isinstance(account, str):
+            return account
+    return None
+
+
+def _swap_amount(entry: dict[str, Any]) -> float:
+    return _as_number(entry.get("tokenAmount", entry.get("amount")))
 
 
 def _transaction_timestamp(transaction: dict[str, Any]) -> int:
@@ -151,6 +175,59 @@ def extract_wallet_buys(
     if transaction.get("type") != "SWAP":
         return []
 
+    events = transaction.get("events")
+    swap_event = events.get("swap") if isinstance(events, dict) else None
+    if isinstance(swap_event, dict):
+        token_outputs = _swap_entries(swap_event.get("tokenOutputs"))
+        sol_spent: dict[str, float] = {}
+        native_input = swap_event.get("nativeInput")
+        for entry in _swap_entries(native_input):
+            wallet = _swap_account(entry)
+            if wallet in tracked_wallets:
+                sol_spent[wallet] = sol_spent.get(wallet, 0.0) + _as_number(
+                    entry.get("amount")
+                )
+
+        token_inputs = _swap_entries(swap_event.get("tokenInputs"))
+        for entry in token_inputs:
+            wallet = _swap_account(entry)
+            if wallet in tracked_wallets and entry.get("mint") == WRAPPED_SOL_MINT:
+                sol_spent[wallet] = sol_spent.get(wallet, 0.0) + _swap_amount(entry)
+
+        timestamp = _transaction_timestamp(transaction)
+        signature = transaction.get("signature")
+        if not isinstance(signature, str) or not signature:
+            logger.warning("Ignoring SWAP transaction without a signature")
+            return []
+
+        buys = []
+        for output in token_outputs:
+            wallet = _swap_account(output)
+            mint = output.get("mint")
+            amount = _swap_amount(output)
+            if (
+                wallet not in tracked_wallets
+                or not isinstance(mint, str)
+                or not mint
+                or _is_ignored_token(mint)
+                or amount <= 0
+            ):
+                continue
+            spent_sol = sol_spent.get(wallet, 0.0)
+            if spent_sol < minimum_buy_sol:
+                continue
+            buys.append(
+                {
+                    "signature": signature,
+                    "wallet": wallet,
+                    "token": mint,
+                    "amount_sol": spent_sol,
+                    "token_amount": amount,
+                    "timestamp": timestamp,
+                }
+            )
+        return buys
+
     transfers = transaction.get("tokenTransfers")
     if not isinstance(transfers, list):
         transfers = []
@@ -173,17 +250,6 @@ def extract_wallet_buys(
             token_deltas[key] = token_deltas.get(key, 0.0) + amount
 
     native_outgoing: dict[str, float] = {}
-    native_transfers = transaction.get("nativeTransfers")
-    if isinstance(native_transfers, list):
-        for transfer in native_transfers:
-            if not isinstance(transfer, dict):
-                continue
-            sender = transfer.get("fromUserAccount")
-            if isinstance(sender, str) and sender in tracked_wallets:
-                native_outgoing[sender] = native_outgoing.get(sender, 0.0) + (
-                    _as_number(transfer.get("amount")) / LAMPORTS_PER_SOL
-                )
-
     wrapped_sol_outgoing: dict[str, float] = {}
     for transfer in transfers:
         if (
@@ -218,21 +284,11 @@ def extract_wallet_buys(
     buys = []
     for (wallet, mint), amount in token_deltas.items():
         if amount <= 0 or _is_ignored_token(
-            mint,
-            next(
-                (
-                    transfer
-                    for transfer in transfers
-                    if isinstance(transfer, dict) and transfer.get("mint") == mint
-                ),
-                {},
-            ),
+            mint
         ):
             continue
 
-        sol_amount = native_outgoing.get(wallet, 0.0)
-        if sol_amount <= 0:
-            sol_amount = wrapped_sol_outgoing.get(wallet, 0.0)
+        sol_amount = wrapped_sol_outgoing.get(wallet, 0.0)
         if sol_amount < minimum_buy_sol:
             continue
         buys.append(
@@ -306,6 +362,72 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
     body = response.json()
     if not isinstance(body, dict) or not body.get("ok"):
         raise RuntimeError("Telegram rejected the message")
+
+
+def _http_status(exception: Exception) -> int | None:
+    response = getattr(exception, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _claim_alert(
+    database_path: str | Path, signature: str, alert_type: str
+) -> bool:
+    with closing(_db_connect(database_path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO alert_claims (signature, alert_type, status)
+            VALUES (?, ?, 'sending')
+            """,
+            (signature, alert_type),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] == 1:
+            return True
+        cursor = connection.execute(
+            """
+            UPDATE alert_claims SET status = 'sending'
+            WHERE signature = ? AND alert_type = ? AND status = 'failed'
+            """,
+            (signature, alert_type),
+        )
+        return cursor.rowcount == 1
+
+
+def _set_alert_status(
+    database_path: str | Path, signature: str, alert_type: str, status: str
+) -> None:
+    with closing(_db_connect(database_path)) as connection, connection:
+        connection.execute(
+            """
+            UPDATE alert_claims SET status = ?
+            WHERE signature = ? AND alert_type = ?
+            """,
+            (status, signature, alert_type),
+        )
+
+
+def _send_claimed_alert(
+    database_path: str | Path,
+    signature: str,
+    alert_type: str,
+    telegram_token: str,
+    chat_id: str,
+    message: str,
+) -> bool:
+    if not _claim_alert(database_path, signature, alert_type):
+        return False
+    try:
+        send_telegram_message(telegram_token, chat_id, message)
+    except Exception as exc:
+        _set_alert_status(database_path, signature, alert_type, "failed")
+        logger.error(
+            "Telegram send failed (%s; HTTP status: %s)",
+            type(exc).__name__,
+            _http_status(exc),
+        )
+        return False
+    _set_alert_status(database_path, signature, alert_type, "sent")
+    return True
 
 
 def _required_telegram_settings() -> tuple[str, str]:
@@ -400,16 +522,30 @@ def _deliver_pending_alerts(
 ) -> None:
     pending_buy, pending_cluster = _save_buy_and_detect_cluster(database_path, buy)
     if pending_buy is not None:
-        send_telegram_message(telegram_token, chat_id, _buy_message(dict(pending_buy)))
-        _mark_alert_sent(database_path, "buys", int(pending_buy["id"]))
+        sent = _send_claimed_alert(
+            database_path,
+            buy["signature"],
+            "buy",
+            telegram_token,
+            chat_id,
+            _buy_message(dict(pending_buy)),
+        )
+        if sent:
+            _mark_alert_sent(database_path, "buys", int(pending_buy["id"]))
     if pending_cluster is not None:
         wallets = json.loads(pending_cluster["wallets_json"])
-        send_telegram_message(
+        sent = _send_claimed_alert(
+            database_path,
+            pending_cluster["token"],
+            "cluster",
             telegram_token,
             chat_id,
             _cluster_message(pending_cluster["token"], wallets),
         )
-        _mark_alert_sent(database_path, "cluster_alerts", pending_cluster["token"])
+        if sent:
+            _mark_alert_sent(
+                database_path, "cluster_alerts", pending_cluster["token"]
+            )
 
 
 def create_app(
@@ -427,9 +563,6 @@ def create_app(
 
     @app.post("/webhook")
     def webhook():
-        if os.getenv("DEBUG_LOG_PAYLOADS", "false").strip().lower() == "true":
-            logger.info("Incoming webhook payload: %s", request.get_data(as_text=True))
-
         webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
         authorization = request.headers.get("Authorization", "")
         if not webhook_secret or not secrets.compare_digest(
@@ -437,12 +570,17 @@ def create_app(
         ):
             return jsonify(error="Unauthorized"), 401
 
+        if os.getenv("DEBUG_LOG_PAYLOADS", "false").strip().lower() == "true":
+            logger.info("Incoming webhook payload: %s", request.get_data(as_text=True))
+
         payload = request.get_json(silent=True)
         if payload is None:
             return jsonify(error="Request body must be valid JSON"), 400
-        transactions = payload if isinstance(payload, list) else [payload]
-        if not all(isinstance(transaction, dict) for transaction in transactions):
-            return jsonify(error="Webhook payload must contain transaction objects"), 400
+        if not isinstance(payload, list) or not all(
+            isinstance(transaction, dict) for transaction in payload
+        ):
+            return jsonify(error="Webhook payload must be a list of transaction objects"), 400
+        transactions = payload
 
         try:
             wallets = load_wallets(app.config["WALLETS_PATH"])
@@ -462,8 +600,12 @@ def create_app(
                     )
                     processed += 1
             return jsonify(status="ok", buys_processed=processed), 200
-        except (OSError, RuntimeError, sqlite3.Error, requests.RequestException, ValueError):
-            logger.exception("Failed to process Helius webhook")
+        except (OSError, RuntimeError, sqlite3.Error, requests.RequestException, ValueError) as exc:
+            logger.error(
+                "Webhook processing failed (%s; HTTP status: %s)",
+                type(exc).__name__,
+                _http_status(exc),
+            )
             return jsonify(error="Webhook processing failed"), 500
 
     @app.get("/health")
@@ -472,8 +614,12 @@ def create_app(
             with closing(_db_connect(app.config["DATABASE_PATH"])) as connection:
                 connection.execute("SELECT 1")
             return jsonify(status="ok"), 200
-        except sqlite3.Error:
-            logger.exception("Health check database query failed")
+        except sqlite3.Error as exc:
+            logger.error(
+                "Health check failed (%s; HTTP status: %s)",
+                type(exc).__name__,
+                _http_status(exc),
+            )
             return jsonify(status="error"), 503
 
     return app

@@ -45,11 +45,16 @@ class FakeHeliusSession:
         return FakeResponse({"webhookID": "created-id"})
 
 
-def make_swap(wallet, signature, token="TokenMint111111111111111111111111111111111"):
+def make_swap(
+    wallet,
+    signature,
+    token="TokenMint111111111111111111111111111111111",
+    timestamp=None,
+):
     return {
         "type": "SWAP",
         "signature": signature,
-        "timestamp": int(time.time()),
+        "timestamp": int(time.time()) if timestamp is None else timestamp,
         "feePayer": wallet,
         "fee": 5000,
         "nativeTransfers": [
@@ -83,6 +88,28 @@ class ExtractWalletBuysTests(unittest.TestCase):
         self.assertEqual(buys[0]["amount_sol"], 2)
         self.assertEqual(buys[0]["token_amount"], 150)
 
+    def test_events_swap_is_primary_and_uses_swap_sol_input(self):
+        wallet = "WalletAddress1111111111111111111111111111111"
+        transaction = make_swap(wallet, "signature-events")
+        transaction["events"] = {
+            "swap": {
+                "tokenInputs": [],
+                "tokenOutputs": [
+                    {
+                        "userAccount": wallet,
+                        "mint": "EventToken1111111111111111111111111111111",
+                        "tokenAmount": 50,
+                    }
+                ],
+                "nativeInput": {"account": wallet, "amount": 1.25},
+                "nativeOutput": None,
+            }
+        }
+        buys = extract_wallet_buys(transaction, {wallet}, 1)
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]["amount_sol"], 1.25)
+        self.assertEqual(buys[0]["token_amount"], 50)
+
     def test_ignores_small_buys_and_stablecoin_outputs(self):
         wallet = "WalletAddress1111111111111111111111111111111"
         small_swap = make_swap(wallet, "signature-small")
@@ -96,6 +123,19 @@ class ExtractWalletBuysTests(unittest.TestCase):
 
 
 class WebhookEndpointTests(unittest.TestCase):
+    def _app(self, directory, wallets):
+        root = Path(directory)
+        wallets_path = root / "wallets.txt"
+        wallets_path.write_text("\n".join(wallets), encoding="utf-8")
+        return create_app(root / "buys.sqlite", wallets_path).test_client()
+
+    def _post(self, client, payload):
+        return client.post(
+            "/webhook",
+            json=payload,
+            headers={"Authorization": "test-secret"},
+        )
+
     def test_persists_buys_and_sends_only_one_cluster_alert(self):
         wallets = [
             "WalletAddress1111111111111111111111111111111",
@@ -127,21 +167,125 @@ class WebhookEndpointTests(unittest.TestCase):
                     headers={"Authorization": "test-secret"},
                 )
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json["buys_processed"], 3)
+                self.assertEqual(response.json["buys_processed"], 3                )
                 self.assertEqual(send_message.call_count, 4)
                 self.assertIn("CLUSTER ALERT", send_message.call_args_list[-1].args[2])
 
-                replay = client.post(
-                    "/webhook",
-                    json=payload[-1],
-                    headers={"Authorization": "test-secret"},
-                )
+                replay = self._post(client, payload[-1:])
                 self.assertEqual(replay.status_code, 200)
                 self.assertEqual(send_message.call_count, 4)
 
             health = client.get("/health")
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json, {"status": "ok"})
+
+    def test_empty_list_payload_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, ["WalletAddress1111111111111111111111111111111"])
+            with patch.dict("os.environ", {"WEBHOOK_SECRET": "test-secret"}):
+                response = self._post(client, [])
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["buys_processed"], 0)
+
+    def test_malformed_transaction_object_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, ["WalletAddress1111111111111111111111111111111"])
+            with patch.dict("os.environ", {"WEBHOOK_SECRET": "test-secret"}):
+                response = self._post(client, [{"type": "SWAP"}, "not a transaction"])
+            self.assertEqual(response.status_code, 400)
+
+    def test_failed_telegram_send_returns_success_and_can_retry(self):
+        wallet = "WalletAddress1111111111111111111111111111111"
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, [wallet])
+            transaction = [make_swap(wallet, "signature-send-fail")]
+            with patch.dict(
+                "os.environ",
+                {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_CHAT_ID": "123",
+                    "WEBHOOK_SECRET": "test-secret",
+                },
+            ), patch(
+                "app.send_telegram_message",
+                side_effect=[RuntimeError("private text"), None],
+            ) as send_message:
+                first = self._post(client, transaction)
+                retry = self._post(client, transaction)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(retry.status_code, 200)
+            self.assertEqual(send_message.call_count, 2)
+
+    def test_duplicate_signature_sends_once(self):
+        wallet = "WalletAddress1111111111111111111111111111111"
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, [wallet])
+            transaction = make_swap(wallet, "signature-duplicate")
+            with patch.dict(
+                "os.environ",
+                {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_CHAT_ID": "123",
+                    "WEBHOOK_SECRET": "test-secret",
+                },
+            ), patch("app.send_telegram_message") as send_message:
+                response = self._post(client, [transaction, transaction])
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(send_message.call_count, 1)
+
+    def test_same_wallet_twice_does_not_create_cluster(self):
+        wallet_a = "WalletAddress1111111111111111111111111111111"
+        wallet_b = "WalletAddress2222222222222222222222222222222"
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, [wallet_a, wallet_b])
+            payload = [
+                make_swap(wallet_a, "same-wallet-1"),
+                make_swap(wallet_a, "same-wallet-2"),
+                make_swap(wallet_b, "other-wallet-1"),
+            ]
+            with patch.dict(
+                "os.environ",
+                {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_CHAT_ID": "123",
+                    "WEBHOOK_SECRET": "test-secret",
+                },
+            ), patch("app.send_telegram_message") as send_message:
+                response = self._post(client, payload)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(send_message.call_count, 3)
+            self.assertFalse(
+                any("CLUSTER ALERT" in call.args[2] for call in send_message.call_args_list)
+            )
+
+    def test_cluster_window_expiry_does_not_count_old_buys(self):
+        wallets = [
+            "WalletAddress1111111111111111111111111111111",
+            "WalletAddress2222222222222222222222222222222",
+            "WalletAddress3333333333333333333333333333333",
+        ]
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._app(directory, wallets)
+            payload = [
+                make_swap(wallets[0], "window-old-1", timestamp=now - 1800),
+                make_swap(wallets[1], "window-old-2", timestamp=now - 1200),
+                make_swap(wallets[2], "window-new", timestamp=now),
+            ]
+            with patch.dict(
+                "os.environ",
+                {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_CHAT_ID": "123",
+                    "WEBHOOK_SECRET": "test-secret",
+                },
+            ), patch("app.send_telegram_message") as send_message:
+                response = self._post(client, payload)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(send_message.call_count, 3)
+            self.assertFalse(
+                any("CLUSTER ALERT" in call.args[2] for call in send_message.call_args_list)
+            )
 
     def test_rejects_invalid_json_body(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -173,7 +317,7 @@ class WebhookEndpointTests(unittest.TestCase):
                     "/webhook", json={}, headers={"Authorization": "wrong-secret"}
                 )
                 accepted = client.post(
-                    "/webhook", json={}, headers={"Authorization": "expected-secret"}
+                    "/webhook", json=[], headers={"Authorization": "expected-secret"}
                 )
             self.assertEqual(missing.status_code, 401)
             self.assertEqual(incorrect.status_code, 401)
