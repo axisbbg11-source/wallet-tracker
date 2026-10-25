@@ -29,6 +29,18 @@ buy and one-time cluster alerts.
    The webhook endpoint is `http://localhost:5000/webhook`; health is available
    at `http://localhost:5000/health`. Deploy behind a production WSGI server and
    HTTPS for public use.
+
+   To send a fake 2 SOL `SWAP` transaction to the configured webhook endpoint,
+   set `WEBHOOK_URL` in `.env` and run:
+
+   ```powershell
+   python send_test_payload.py
+   ```
+
+   The script uses the first wallet in `wallets.txt`, generates a unique
+   transaction signature for each run, and prints only the HTTP status code. The
+   request is processed like any other webhook and may trigger normal alerts.
+
 5. Make the webhook URL publicly reachable, then create or update the Helius
    webhook (the script matches an existing webhook by URL and configures its
    `authHeader` from `WEBHOOK_SECRET`):

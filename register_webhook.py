@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,37 @@ logger = logging.getLogger(__name__)
 
 HELIUS_API_URL = "https://api.helius.xyz/v0/webhooks"
 WALLETS_PATH = Path(__file__).resolve().parent / "wallets.txt"
+
+
+def _helius_error_detail(
+    response: Any, sensitive_values: tuple[str, ...]
+) -> str | None:
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except (ValueError, requests.RequestException):
+        return None
+    if not isinstance(body, dict):
+        return None
+
+    detail = body.get("error")
+    if not isinstance(detail, str) or not detail:
+        detail = body.get("message")
+    if not isinstance(detail, str) or not detail:
+        return None
+
+    for value in sensitive_values:
+        if value:
+            detail = detail.replace(value, "[REDACTED]")
+    detail = re.sub(r"https?://\S+", "[URL REDACTED]", detail)
+    detail = re.sub(r"\?[^\s]*", "[QUERY REDACTED]", detail)
+    detail = re.sub(
+        r"(?im)^(?:authorization|cookie|x-api-key|api-key)\s*:\s*.*$",
+        "[HEADER REDACTED]",
+        detail,
+    )
+    return detail[:300]
 
 
 def load_wallets(wallets_path: str | Path = WALLETS_PATH) -> list[str]:
@@ -125,10 +157,14 @@ def main() -> int:
         )
     except (OSError, ValueError, requests.RequestException) as exc:
         response = getattr(exc, "response", None)
+        detail = _helius_error_detail(
+            response, (arguments.webhook_url, api_key, webhook_secret)
+        )
         logger.error(
-            "Unable to register Helius webhook (%s; HTTP status: %s)",
+            "Unable to register Helius webhook (%s; HTTP status: %s)%s",
             type(exc).__name__,
             getattr(response, "status_code", None),
+            f": {detail}" if detail else "",
         )
         return 1
     logger.info(result)

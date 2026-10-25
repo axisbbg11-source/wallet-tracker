@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 from app import (
     USDC_MINT,
     USDT_MINT,
@@ -11,6 +13,7 @@ from app import (
     create_app,
     extract_wallet_buys,
 )
+from register_webhook import main as register_webhook_main
 from register_webhook import register_webhook
 
 
@@ -325,6 +328,49 @@ class WebhookEndpointTests(unittest.TestCase):
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_http_error_logs_sanitized_response_detail(self):
+        api_key = "private-api-key"
+        webhook_secret = "private-webhook-secret"
+        webhook_url = "https://example.test/webhook?token=private-token"
+
+        class ErrorResponse:
+            status_code = 403
+
+            def json(self):
+                return {
+                    "error": (
+                        f"Rejected {api_key} {webhook_secret} {webhook_url} "
+                        f"https://api.helius.xyz/path?api-key={api_key} "
+                        + ("x" * 301)
+                    )
+                }
+
+        http_error = requests.HTTPError(response=ErrorResponse())
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "HELIUS_API_KEY": api_key,
+                    "WEBHOOK_SECRET": webhook_secret,
+                },
+            ),
+            patch("sys.argv", ["register_webhook.py", "--webhook-url", webhook_url]),
+            patch("register_webhook.requests.get", side_effect=http_error),
+            self.assertLogs("register_webhook", level="ERROR") as captured,
+        ):
+            self.assertEqual(register_webhook_main(), 1)
+
+        logged = "\n".join(captured.output)
+        self.assertIn("Rejected", logged)
+        self.assertNotIn(api_key, logged)
+        self.assertNotIn(webhook_secret, logged)
+        self.assertNotIn(webhook_url, logged)
+        self.assertNotIn("api-key=", logged)
+        self.assertNotIn("https://", logged)
+        detail = logged.rsplit(": ", 1)[-1]
+        self.assertEqual(len(detail), 300)
+        self.assertNotIn("x" * 301, logged)
+
     def test_updates_matching_webhook_and_creates_when_missing(self):
         webhook_url = "https://example.test/webhook"
         wallets = ["Wallet111", "Wallet222"]
